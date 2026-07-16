@@ -1,6 +1,6 @@
 import Foundation
 import SwiftGit2
-import Clibgit2 // SwiftGit2 依赖的 C 层，stash 相关 API 目前 SwiftGit2 没有包装，直接调 libgit2
+import Clibgit2 // SwiftGit2(SwiftGit3 fork)依赖的 C 层；stash 和认证 fetch 目前没有高层封装，直接调用
 
 enum GitServiceError: LocalizedError {
     case invalidURL
@@ -35,48 +35,55 @@ struct SyncOutcome {
     var stashPopHadConflict: Bool = false
 }
 
+// MARK: - 手写的认证回调（SwiftGit3 内部的 credentials 回调是 internal，外部模块调不到，只能自己实现一份）
+
+/// 简单起见：同一时间只做一个 git 操作，用一个文件私有的静态变量传当前操作用的 PAT。
+/// 这是个人工具在"串行执行 git 操作"前提下的实用取舍，不是通用做法。
+private enum CurrentAuth {
+    static var username: String = "x-access-token"
+    static var password: String = ""
+}
+
+/// 必须是没有闭包捕获的顶层函数，才能当 C 函数指针传给 libgit2
+private func gitSyncCredentialsCallback(
+    cred: UnsafeMutablePointer<UnsafeMutablePointer<git_cred>?>?,
+    url: UnsafePointer<CChar>?,
+    usernameFromURL: UnsafePointer<CChar>?,
+    allowedTypes: UInt32,
+    payload: UnsafeMutableRawPointer?
+) -> Int32 {
+    let result = git_cred_userpass_plaintext_new(cred, CurrentAuth.username, CurrentAuth.password)
+    return result == GIT_OK.rawValue ? 0 : -1
+}
+
 final class GitService {
 
-    // MARK: - 凭证
-
-    private func credentials(token: String) -> Credentials {
-        // GitHub PAT：HTTPS 场景下用户名随意填（GitHub 不校验），密码用 token
-        .plaintext(username: "x-access-token", password: token)
-    }
-
-    // MARK: - 一次性 clone（首次配置时调用）
+    // MARK: - 一次性 clone（首次配置时调用，用 SwiftGit2 自带的 clone，它内部已经处理好认证）
 
     func clone(remoteURL: URL, to localFolder: URL, branch: String, token: String) throws {
-        let creds = credentials(token: token)
-        do {
-            _ = try Repository.clone(
-                from: remoteURL,
-                at: localFolder,
-                localClone: false,
-                bare: false,
-                credentials: creds,
-                checkoutStrategy: .Safe,
-                checkoutProgress: nil
-            ).get()
-        } catch {
-            throw GitServiceError.cloneFailed("\(error)")
+        let creds = Credentials.plaintext(username: "x-access-token", password: token)
+        let result = Repository.clone(
+            from: remoteURL,
+            to: localFolder,
+            localClone: false,
+            bare: false,
+            credentials: creds,
+            checkoutStrategy: .Safe,
+            checkoutProgress: nil
+        )
+        if case .failure(let e) = result {
+            throw GitServiceError.cloneFailed("\(e)")
         }
     }
 
-    /// 判断目标文件夹是否已经是一个 git 仓库（用于区分"首次 clone"还是"已有仓库直接用"）
+    /// 判断目标文件夹是否已经是一个 git 仓库
     func isExistingRepo(at localFolder: URL) -> Bool {
         let gitDir = localFolder.appendingPathComponent(".git")
         return FileManager.default.fileExists(atPath: gitDir.path)
     }
 
-    // MARK: - 下载（保留本地未提交修改）：stash -> fetch+merge/reset -> pop
+    // MARK: - 下载（保留本地未提交修改）：stash -> fetch+fast-forward -> pop
 
-    /// 一键"下载"：
-    /// 1. 如果本地有未提交修改，先 git stash
-    /// 2. fetch 远程 + 把当前分支快进到远程最新（fast-forward）
-    /// 3. 如果第 1 步 stash 过，尝试 stash pop
-    ///    - 成功：修改被保留在工作区
-    ///    - 冲突：不自动处理，把 stash 保留在 stash 列表里，抛错让用户自己去处理（用 git 客户端或后续版本加冲突 UI）
     func download(localFolder: URL, branch: String, token: String) throws -> SyncOutcome {
         var repoPtr: OpaquePointer?
         let openStatus = git_repository_open(&repoPtr, localFolder.path)
@@ -93,11 +100,9 @@ final class GitService {
             stashed = true
         }
 
-        // fetch + fast-forward 当前分支
         do {
-            try fetchAndFastForward(repoPath: localFolder, branch: branch, token: token)
+            try authenticatedFetchAndFastForward(localFolder: localFolder, branch: branch, token: token)
         } catch {
-            // fetch 失败的话，如果之前 stash 过，先弹回去，别把用户的修改丢在 stash 里
             if stashed {
                 _ = try? stashPop(repo)
             }
@@ -108,7 +113,6 @@ final class GitService {
             do {
                 try stashPop(repo)
             } catch let e as GitServiceError {
-                // pop 冲突：stash 保留在列表里（不 drop），提示用户手动处理
                 if case .stashPopConflict = e {
                     return SyncOutcome(
                         message: "已拉取远程最新内容，但恢复本地修改时出现冲突，改动仍保存在 git stash 里，需要手动解决（stash 未丢失）。",
@@ -130,95 +134,72 @@ final class GitService {
     // MARK: - 上传：add -A + commit + push
 
     func upload(localFolder: URL, branch: String, token: String, commitMessage: String? = nil) throws -> SyncOutcome {
-        guard let repo = try? Repository.at(localFolder).get() else {
+        guard case .success(let repo) = Repository.at(localFolder) else {
             throw GitServiceError.notARepo
         }
 
-        let dirty = try isDirtyViaSwiftGit2(repo)
+        var repoPtr: OpaquePointer?
+        guard git_repository_open(&repoPtr, localFolder.path) == 0, let checkPtr = repoPtr else {
+            throw GitServiceError.notARepo
+        }
+        let dirty = repositoryIsDirty(checkPtr)
+        git_repository_free(checkPtr)
+
         if !dirty {
             return SyncOutcome(message: "没有需要提交的改动。")
         }
 
-        // add -A
-        do {
-            try addAll(localFolder: localFolder)
-        } catch {
-            throw GitServiceError.commitFailed("\(error)")
+        // add -A（"." 作为 pathspec 匹配所有文件）
+        if case .failure(let e) = repo.add(path: ".") {
+            throw GitServiceError.commitFailed("\(e)")
         }
 
-        // commit
+        // commit（用 SwiftGit2 自带的高层 API：基于当前 index 内容 + HEAD 作为 parent）
         let message = commitMessage ?? "GitSync auto commit \(ISO8601DateFormatter().string(from: Date()))"
-        do {
-            try commitAll(localFolder: localFolder, message: message)
-        } catch {
-            throw GitServiceError.commitFailed("\(error)")
+        let signature = Signature(name: "GitSync", email: "gitsync@local")
+        if case .failure(let e) = repo.commit(message: message, signature: signature) {
+            throw GitServiceError.commitFailed("\(e)")
         }
 
-        // push
-        let creds = credentials(token: token)
-        do {
-            let remote = try repo.remote(named: "origin").get()
-            let pushResult = repo.push(remote, credentials: creds, branch: branch)
-            if case .failure(let e) = pushResult {
-                throw GitServiceError.pushFailed("\(e)。远程可能有新提交，建议先执行「下载」再重试。")
-            }
-        } catch let e as GitServiceError {
-            throw e
-        } catch {
-            throw GitServiceError.pushFailed("\(error)")
-        }
+        // push（SwiftGit2 这份 push 直接接受 username/password，不需要额外包 Credentials）
+        CurrentAuth.username = "x-access-token"
+        CurrentAuth.password = token
+        repo.push(repo, "x-access-token", token, branch)
+        // 注意：这个 fork 的 push() 目前没有返回值，无法在这里拿到"是否真的推送成功"的明确结果，
+        // 如果远程有冲突，libgit2 层会打印错误但不会抛出 Swift 错误——这是当前实现的已知局限。
 
-        return SyncOutcome(message: "已提交并推送到远程。")
+        return SyncOutcome(message: "已提交并尝试推送到远程（如果远程有新提交导致冲突，请先执行「下载」）。")
     }
 
-    // MARK: - libgit2 底层辅助（stash / dirty 检测走 C API，因为 SwiftGit2 未包装 stash）
+    // MARK: - 底层辅助：脏检测 / stash（走 Clibgit2 C API，因为 SwiftGit2 未包装这部分）
 
     private func repositoryIsDirty(_ repo: OpaquePointer) -> Bool {
-        var dirty = false
         var opts = git_status_options()
         git_status_init_options(&opts, UInt32(GIT_STATUS_OPTIONS_VERSION))
         opts.show = GIT_STATUS_SHOW_INDEX_AND_WORKDIR
         opts.flags = GIT_STATUS_OPT_INCLUDE_UNTRACKED.rawValue | GIT_STATUS_OPT_RECURSE_UNTRACKED_DIRS.rawValue
 
-        git_status_foreach_ext(repo, &opts, { _, _, _ in
-            // 只要回调被触发一次，就说明有变更
-            return 0
-        }, nil)
-
-        // git_status_foreach_ext 本身不方便直接拿"是否有变更"的布尔值，
-        // 用 git_status_list 更直接：
         var list: OpaquePointer?
-        if git_status_list_new(&list, repo, &opts) == 0, let list = list {
-            let count = git_status_list_entrycount(list)
-            dirty = count > 0
-            git_status_list_free(list)
+        guard git_status_list_new(&list, repo, &opts) == 0, let list = list else {
+            return false
         }
-        return dirty
-    }
-
-    private func isDirtyViaSwiftGit2(_ repo: Repository) throws -> Bool {
-        // 通过底层指针复用同一套检测逻辑
-        // 注意：如果 SwiftGit2 的 Repository.pointer 不是 public，
-        // 这里需要改成重新 git_repository_open(repo.directoryURL.path) 一份
-        var repoPtr: OpaquePointer?
-        guard git_repository_open(&repoPtr, repo.directoryURL.path) == 0, let ptr = repoPtr else {
-            throw GitServiceError.openFailed("无法重新打开仓库用于状态检测")
-        }
-        defer { git_repository_free(ptr) }
-        return repositoryIsDirty(ptr)
+        defer { git_status_list_free(list) }
+        return git_status_list_entrycount(list) > 0
     }
 
     private func stashSave(_ repo: OpaquePointer, message: String) throws {
-        var sig: OpaquePointer?
-        _ = git_signature_default(&sig, repo) // 用不到就走 default，失败的话下面 fallback
-        if sig == nil {
-            git_signature_now(&sig, "GitSync", "gitsync@local")
+        var sig: UnsafeMutablePointer<git_signature>?
+        if git_signature_default(&sig, repo) != 0 {
+            _ = git_signature_now(&sig, "GitSync", "gitsync@local")
         }
-        defer { if let s = sig { git_signature_free(s) } }
+        guard let signature = sig else {
+            throw GitServiceError.stashFailed("无法创建 git signature")
+        }
+        defer { git_signature_free(signature) }
 
         var oid = git_oid()
         let flags = GIT_STASH_INCLUDE_UNTRACKED.rawValue
-        let status = git_stash_save(&oid, repo, sig, message, flags)
+        let status = git_stash_save(&oid, repo, signature, message, flags)
         guard status == 0 else {
             throw GitServiceError.stashFailed("git_stash_save 返回 \(status)")
         }
@@ -226,88 +207,77 @@ final class GitService {
 
     private func stashPop(_ repo: OpaquePointer) throws {
         var opts = git_stash_apply_options()
-        git_stash_apply_options_init(&opts, UInt32(GIT_STASH_APPLY_OPTIONS_VERSION))
-        opts.flags = GIT_STASH_APPLY_DEFAULT.rawValue
+        git_stash_apply_init_options(&opts, UInt32(GIT_STASH_APPLY_OPTIONS_VERSION))
+        opts.flags = GIT_STASH_APPLY_DEFAULT
 
         let status = git_stash_pop(repo, 0, &opts)
-        if status == Int32(GIT_ECONFLICT.rawValue) || status < 0 {
+        guard status == 0 else {
+            // 冲突或其他失败：stash 保留在列表里，不 drop，交给用户手动处理
             throw GitServiceError.stashPopConflict("git_stash_pop 返回 \(status)")
         }
     }
 
-    private func fetchAndFastForward(repoPath: URL, branch: String, token: String) throws {
-        guard let repo = try? Repository.at(repoPath).get() else {
-            throw GitServiceError.notARepo
-        }
-        let creds = credentials(token: token)
-        let remote = try repo.remote(named: "origin").get()
+    // MARK: - 底层辅助：带认证的 fetch + fast-forward（SwiftGit2 自带的 fetch 不支持认证，这里手写）
 
-        let fetchResult = repo.fetch(remote, credentials: creds)
-        if case .failure(let e) = fetchResult {
-            throw GitServiceError.fetchFailed("\(e)")
-        }
-
-        // 快进当前分支到 origin/<branch>
-        do {
-            let remoteBranchRef = "refs/remotes/origin/\(branch)"
-            guard let remoteOid = try? repo.reference(named: remoteBranchRef).get().oid else {
-                throw GitServiceError.fetchFailed("找不到远程分支 \(remoteBranchRef)")
-            }
-            let localRefName = "refs/heads/\(branch)"
-            let checkoutResult = repo.checkout(
-                remoteOid,
-                strategy: [.Force, .RecreateMissing],
-                progress: nil
-            )
-            if case .failure(let e) = checkoutResult {
-                throw GitServiceError.fetchFailed("checkout 失败：\(e)")
-            }
-            // 移动分支引用指向最新 commit（实现 fast-forward）
-            _ = try? repo.reference(named: localRefName).get()
-                .set(oid: remoteOid)
-        }
-    }
-
-    private func addAll(localFolder: URL) throws {
-        guard let repo = try? Repository.at(localFolder).get() else {
-            throw GitServiceError.notARepo
-        }
-        var index: OpaquePointer?
+    private func authenticatedFetchAndFastForward(localFolder: URL, branch: String, token: String) throws {
         var repoPtr: OpaquePointer?
-        guard git_repository_open(&repoPtr, localFolder.path) == 0, let rp = repoPtr else {
+        guard git_repository_open(&repoPtr, localFolder.path) == 0, let repo = repoPtr else {
             throw GitServiceError.notARepo
         }
-        defer { git_repository_free(rp) }
-        guard git_repository_index(&index, rp) == 0, let idx = index else {
-            throw GitServiceError.commitFailed("无法打开 index")
-        }
-        defer { git_index_free(idx) }
+        defer { git_repository_free(repo) }
 
-        var pathspec = git_strarray(strings: nil, count: 0)
-        let status = git_index_add_all(idx, &pathspec, GIT_INDEX_ADD_DEFAULT.rawValue, nil, nil)
-        guard status == 0 else {
-            throw GitServiceError.commitFailed("git_index_add_all 返回 \(status)")
+        var remote: OpaquePointer?
+        guard git_remote_lookup(&remote, repo, "origin") == 0, let remotePtr = remote else {
+            throw GitServiceError.fetchFailed("找不到 origin 远程")
         }
-        _ = git_index_write(idx)
-        _ = repo // 保持引用避免提前释放
-    }
+        defer { git_remote_free(remotePtr) }
 
-    private func commitAll(localFolder: URL, message: String) throws {
-        guard let repo = try? Repository.at(localFolder).get() else {
-            throw GitServiceError.notARepo
+        CurrentAuth.username = "x-access-token"
+        CurrentAuth.password = token
+
+        var fetchOpts = git_fetch_options()
+        git_fetch_init_options(&fetchOpts, UInt32(GIT_FETCH_OPTIONS_VERSION))
+        fetchOpts.callbacks.credentials = gitSyncCredentialsCallback
+
+        let fetchStatus = git_remote_fetch(remotePtr, nil, &fetchOpts, nil)
+        guard fetchStatus == 0 else {
+            throw GitServiceError.fetchFailed("git_remote_fetch 返回 \(fetchStatus)")
         }
-        let sig = Signature(name: "GitSync", email: "gitsync@local", time: Date(), timeZone: TimeZone.current)
-        let head = try? repo.HEAD().get()
-        let parentCommit: Commit? = {
-            guard let h = head, let oid = h.oid as OID? else { return nil }
-            return try? repo.commit(oid).get()
-        }()
-        let tree = try repo.commit(
-            tree: nil, // nil 表示使用当前 index 内容生成 tree（视 SwiftGit2 版本可能需要显式写 index -> tree）
-            message: message,
-            signature: sig,
-            parents: parentCommit.map { [$0] } ?? []
-        ).get()
-        _ = tree
+
+        // 找远程分支最新的 commit
+        var remoteRefPtr: OpaquePointer?
+        let remoteRefName = "refs/remotes/origin/\(branch)"
+        guard git_reference_lookup(&remoteRefPtr, repo, remoteRefName) == 0, let remoteRef = remoteRefPtr else {
+            throw GitServiceError.fetchFailed("找不到远程分支引用 \(remoteRefName)")
+        }
+        defer { git_reference_free(remoteRef) }
+        guard let targetOidPtr = git_reference_target(remoteRef) else {
+            throw GitServiceError.fetchFailed("远程分支引用没有目标 commit")
+        }
+        var targetOid = targetOidPtr.pointee
+
+        // 把本地分支引用强制指向远程最新 commit（fast-forward）
+        let localRefName = "refs/heads/\(branch)"
+        var newLocalRefPtr: OpaquePointer?
+        let updateStatus = git_reference_create(&newLocalRefPtr, repo, localRefName, &targetOid, 1, nil)
+        guard updateStatus == 0, let newLocalRef = newLocalRefPtr else {
+            throw GitServiceError.fetchFailed("更新本地分支引用失败，返回 \(updateStatus)")
+        }
+        defer { git_reference_free(newLocalRef) }
+
+        // 把 HEAD 挂到这个分支上（保持在分支上而不是 detached HEAD）
+        let setHeadStatus = git_repository_set_head(repo, localRefName)
+        guard setHeadStatus == 0 else {
+            throw GitServiceError.fetchFailed("git_repository_set_head 返回 \(setHeadStatus)")
+        }
+
+        // 用新的 HEAD 内容更新工作目录
+        var checkoutOpts = git_checkout_options()
+        git_checkout_init_options(&checkoutOpts, UInt32(GIT_CHECKOUT_OPTIONS_VERSION))
+        checkoutOpts.checkout_strategy = GIT_CHECKOUT_FORCE.rawValue
+        let checkoutStatus = git_checkout_head(repo, &checkoutOpts)
+        guard checkoutStatus == 0 else {
+            throw GitServiceError.fetchFailed("git_checkout_head 返回 \(checkoutStatus)")
+        }
     }
 }
