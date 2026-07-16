@@ -47,7 +47,7 @@ jobs:
             -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_IDENTITY="" \
             -derivedDataPath build \
             clean build
 
@@ -55,10 +55,34 @@ jobs:
         run: |
           set -e
           APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app")
+          if [ -z "$APP_PATH" ]; then
+            echo "找不到 .app 产物，构建可能没有真正成功"
+            find build/Build/Products -maxdepth 3
+            exit 1
+          fi
+          echo "找到 app：$APP_PATH"
+          ls -la "$APP_PATH"
+
+          # 确认可执行文件确实存在且不是空文件
+          EXECUTABLE="$APP_PATH/GitSync"
+          if [ ! -s "$EXECUTABLE" ]; then
+            echo "可执行文件缺失或为空：$EXECUTABLE"
+            exit 1
+          fi
+          file "$EXECUTABLE"
+
+          # 清掉任何残留签名，确保交给 Sideloadly 的是彻底"干净"的未签名产物
+          codesign --remove-signature "$EXECUTABLE" || true
+
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
-          zip -r GitSync-unsigned.ipa Payload
+          # 用 ditto 而不是 zip，能更好地保留 iOS App Bundle 需要的资源分叉/属性，
+          # 这也是苹果自己工具链打包 ipa 时用的方式
+          ditto -c -k --sequesterRsrc --keepParent Payload GitSync-unsigned.ipa
           rm -rf Payload
+
+          echo "最终 ipa 大小："
+          ls -la GitSync-unsigned.ipa
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
