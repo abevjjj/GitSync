@@ -11,8 +11,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - name: Install XcodeGen (direct download, avoids flaky Homebrew taps on CI)
+        run: |
+          set -e
+          curl -L -o xcodegen.zip \
+            "https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.artifactbundle.zip"
+          unzip -q xcodegen.zip -d xcodegen_bundle
+          BIN_PATH=$(find xcodegen_bundle -type f -name "xcodegen" -perm -u+x | head -n 1)
+          if [ -z "$BIN_PATH" ]; then
+            BIN_PATH=$(find xcodegen_bundle -type f -name "xcodegen" | head -n 1)
+            chmod +x "$BIN_PATH"
+          fi
+          sudo mkdir -p /usr/local/bin
+          sudo cp "$BIN_PATH" /usr/local/bin/xcodegen
+          xcodegen --version
 
       - name: Generate Xcode project
         run: xcodegen generate
