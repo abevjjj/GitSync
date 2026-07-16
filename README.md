@@ -79,9 +79,10 @@ git push -u origin main
 
 这套代码是在**没有 macOS/Xcode 环境**的情况下写就的（我只能在 Linux 容器里写文本，无法在本地实际编译 Swift/iOS 代码验证）。结构和逻辑是对的，但推送到 GitHub 后，第一次跑 Actions 大概率会遇到一些需要小修的地方，最可能出问题的位置：
 
-1. **`GitService.swift` 里 `git_stash_*` 相关的 libgit2 C API 调用**——libgit2 不同版本这块函数签名/常量名有细微差异（如 `GIT_STASH_APPLY_OPTIONS_VERSION` 的宏定义方式），如果编译报错，把报错信息发我，我照着改。
-2. **`Repository.commit(...)` 的参数签名**——SwiftGit2 该 API 在不同版本间变化过，如果报"找不到该方法/参数不匹配"，需要对照你实际拉到的 SwiftGit2 版本调整。
-3. **`repo.checkout` / `repo.fetch` / `repo.push` 的方法签名**同理，SwiftGit2 是一个仍在演进中的库，`project.yml` 里锁的是 `main` 分支，如果想要更稳定，可以改成锁某个 tag。
+1. **依赖已改为 `App-Maker-Software/SwiftGit3`**——原始的 `SwiftGit2/SwiftGit2` 仓库是用 Carthage/submodule 管理的老项目，不支持 Swift Package Manager，默认分支也是 `master`。SwiftGit3 是一个专门做了 SPM 适配、额外支持 push 等功能的活跃 fork，import 名称依然是 `SwiftGit2`，代码不需要改。
+2. **`GitService.swift` 里 `import Clibgit2` 是接下来最可能卡住的一步**——SwiftGit3 的 `Package.swift` 里只把 `SwiftGit2` 这个 library 声明为对外 product，`Clibgit2` 是它内部依赖的 binaryTarget，我目前没法确认它是否被 `@_exported` 出来给外部直接 `import`。如果编译报"找不到模块 Clibgit2"，把报错发我，我会把 `git_stash_*` 那部分改成直接内联 C 头文件绑定，或者改用 SwiftGit3 自带的高层 API（如果它已经包装了 stash/pull 相关功能的话，可以精简掉那段手写的底层调用）。
+3. **`git_stash_*` 相关的 libgit2 C API 调用**——libgit2 不同版本这块函数签名/常量名有细微差异（如 `GIT_STASH_APPLY_OPTIONS_VERSION` 的宏定义方式），如果编译报错，把报错信息发我，我照着改。
+4. **`Repository.commit(...)` / `repo.checkout` / `repo.fetch` / `repo.push` 的方法签名**——不同版本间可能有变化，报"找不到该方法/参数不匹配"的话，对照实际拉到的版本调整即可。
 
 修法很简单：把 CI 报错的完整日志贴给我，我按照报错逐个调整对应的 Swift 代码就行，这类"编译期签名不匹配"的问题不涉及架构改动。
 

@@ -7,7 +7,7 @@ options:
 
 packages:
   SwiftGit2:
-    url: https://github.com/SwiftGit2/SwiftGit2
+    url: https://github.com/App-Maker-Software/SwiftGit3
     branch: main
 
 targets:
