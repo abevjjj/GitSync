@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSFileProviderDomainUsageDescription</key>
+    <string>需要访问你在“文件”App 中选择的位置来同步仓库内容</string>
+</dict>
+</plist>
